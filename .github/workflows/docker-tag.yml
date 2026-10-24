@@ -1,0 +1,120 @@
+name: Tag Docker images
+
+# Tags the Docker images built for a release commit with the release version
+# and latest.
+# The images themselves are built and pushed by the CI workflow on every push
+# to master, tagged with master and the commit SHA; this adds release tags to
+# those manifests after the Docker specs pass, without rebuilding anything.
+# Push a release tag only after the CI run for its commit has published the
+# images, or dispatch this workflow with the tag name afterwards.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to apply to the images built for its commit, e.g. v2026.09.08"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test-docker-images:
+    name: Test release Docker images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - name: Resolve the release commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Check out Docker specs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: huginn/huginn_docker_specs
+          ref: 3abd4c42eb284e78eb6f4b35ee6c36861b09dfab
+          path: docker-specs
+          persist-credentials: false
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@26e5b7d197ebf60545ee9667bcbace0be11ccaec # v1.334.0
+        with:
+          ruby-version: "4.0.9"
+          working-directory: docker-specs
+
+      - name: Install spec dependencies
+        working-directory: docker-specs
+        run: bundle install --jobs 4 --retry 3
+
+      - name: Run Docker specs
+        working-directory: docker-specs
+        env:
+          HUGINN_MULTI_IMAGE: ghcr.io/huginn/huginn:${{ steps.commit.outputs.sha }}
+          HUGINN_SINGLE_IMAGE: ghcr.io/huginn/huginn-single-process:${{ steps.commit.outputs.sha }}
+        run: bundle exec rake
+
+  tag-docker-images:
+    name: docker-tag-${{ matrix.docker_image }}
+    needs: test-docker-images
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        docker_image:
+          - huginn/huginn
+          - huginn/huginn-single-process
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tag the images built for the release commit
+        env:
+          SHA: ${{ needs.test-docker-images.outputs.sha }}
+          GHCR_IMAGE: ghcr.io/${{ matrix.docker_image }}
+          DOCKERHUB_IMAGE: ${{ matrix.docker_image }}
+        run: |
+          for image in "$GHCR_IMAGE" "$DOCKERHUB_IMAGE"; do
+            docker buildx imagetools create \
+              -t "$image:$TAG" \
+              -t "$image:latest" \
+              "$image:$SHA"
+          done
